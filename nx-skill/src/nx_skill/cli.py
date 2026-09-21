@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import __version__
+from . import images as images
 from .config import Settings
 from .contracts import SkillError, dumps, fail, ok
 from .discovery import find_all
@@ -179,6 +180,61 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 def cmd_visual(args: argparse.Namespace) -> int:
     return _emit(ok(visual_spec(args.prompt, projection_system=args.projection)))
+
+
+def cmd_image(args: argparse.Namespace) -> int:
+    """Image input from the shell — the same work the nx_image_* MCP tools do.
+
+    Kept here so a human (or a host without MCP) can reproduce exactly what the
+    agent did: `nx-skill image read drawing.png` prints the same envelope the
+    tool returns.
+    """
+    workspace = images.workspace_for(_settings(args).workspace)
+    command = args.image_command
+
+    if command == "caps":
+        return _emit(ok({**images.capabilities(), "workspace": str(workspace.root)}))
+
+    if command == "read":
+        known = None
+        if args.known_value is not None:
+            if args.known_pixels is None:
+                raise SkillError(
+                    "--known-value needs --known-pixels (the pixel span you measured).",
+                    code="INVALID_ARGUMENT",
+                )
+            known = {"pixels": args.known_pixels, "value": args.known_value, "unit": args.known_unit}
+        payload = images.describe_image(
+            args.path,
+            workspace=workspace,
+            allow_external=True,
+            allow_small=args.allow_small,
+            min_side=args.min_side,
+            known_dimension=known,
+            hints=args.hint or (),
+        )
+        if args.inline:
+            payload["dataUrl"] = images.data_url_for(payload["file"]["path"])
+        return _emit(ok(payload))
+
+    if command == "prepare":
+        return _emit(
+            ok(
+                images.prepare_image(
+                    args.path,
+                    workspace=workspace,
+                    max_side=args.max_side,
+                    fmt=args.fmt,
+                    quality=args.quality,
+                    grayscale=args.grayscale,
+                    autocontrast=not args.no_autocontrast,
+                    allow_small=True,
+                    inline=args.inline,
+                )
+            )
+        )
+
+    raise SkillError(f"Unknown image subcommand: {command}", code="INVALID_ARGUMENT")
 
 
 def _require_install(settings: Settings, args: argparse.Namespace):
@@ -346,6 +402,29 @@ def build_parser() -> argparse.ArgumentParser:
     visual.add_argument("prompt", nargs="?", default="")
     visual.add_argument("--projection", default="infer")
     visual.set_defaults(func=cmd_visual)
+
+    image = sub.add_parser("image", help="read, measure and normalise an image (drawing, photo, reference)")
+    image_sub = image.add_subparsers(dest="image_command", required=True)
+    image_sub.add_parser("caps", help="does this interpreter have Pillow/numpy?").set_defaults(func=cmd_image)
+    i_read = image_sub.add_parser("read", help="file facts, measurements and an ASCII ink map")
+    i_read.add_argument("path")
+    i_read.add_argument("--min-side", type=int, default=images.DEFAULT_MIN_SIDE)
+    i_read.add_argument("--allow-small", action="store_true")
+    i_read.add_argument("--known-pixels", type=float, help="pixel span you measured on the image")
+    i_read.add_argument("--known-value", type=float, help="its real length, in --known-unit")
+    i_read.add_argument("--known-unit", default="mm")
+    i_read.add_argument("--hint", action="append")
+    i_read.add_argument("--inline", action="store_true", help="also emit a base64 data URL")
+    i_read.set_defaults(func=cmd_image)
+    i_prep = image_sub.add_parser("prepare", help="normalise a copy into the workspace")
+    i_prep.add_argument("path")
+    i_prep.add_argument("--max-side", type=int, default=images.DEFAULT_MAX_SIDE)
+    i_prep.add_argument("--fmt", default="jpeg", choices=list(images.WRITABLE_FORMATS))
+    i_prep.add_argument("--quality", type=int, default=88)
+    i_prep.add_argument("--grayscale", action="store_true")
+    i_prep.add_argument("--no-autocontrast", action="store_true")
+    i_prep.add_argument("--inline", action="store_true", help="also emit a base64 data URL")
+    i_prep.set_defaults(func=cmd_image)
 
     journal = sub.add_parser("journal", help="run NXOpen journals in a batch NX process")
     journal_sub = journal.add_subparsers(dest="journal_command", required=True)

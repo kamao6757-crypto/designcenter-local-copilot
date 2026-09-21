@@ -25,14 +25,17 @@ const CFG_PATH = path.join(ROOT, "config.json");
  * 配置:多供应商
  * ------------------------------------------------------------------ */
 const PRESETS = {
-  "mimo-tokenplan": { label: "小米 MiMo(Token Plan)", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", model: "mimo-v2.5", models: ["mimo-v2.5", "mimo-v2.5-pro"] },
-  "mimo":           { label: "小米 MiMo(标准 sk-)",  baseUrl: "https://api.xiaomimimo.com/v1",        model: "mimo-v2.5", models: ["mimo-v2.5", "mimo-v2.5-pro"] },
-  "deepseek":       { label: "DeepSeek",              baseUrl: "https://api.deepseek.com/v1",          model: "deepseek-chat", models: ["deepseek-chat", "deepseek-reasoner"] },
-  "openai":         { label: "OpenAI",                baseUrl: "https://api.openai.com/v1",            model: "gpt-4o-mini", models: ["gpt-4o-mini", "gpt-4o"] },
-  "ollama":         { label: "Ollama(本地)",          baseUrl: "http://127.0.0.1:11434/v1",            model: "qwen2.5:7b", models: ["qwen2.5:7b", "qwen2.5:14b"] },
-  "lmstudio":       { label: "LM Studio(本地)",       baseUrl: "http://127.0.0.1:1234/v1",             model: "local-model", models: [] },
-  "mock":           { label: "内置自测(mock)",        baseUrl: "http://127.0.0.1:8765/mock/v1",        model: "mock-model", models: ["mock-model"] },
-  "custom":         { label: "自定义(OpenAI 兼容)",   baseUrl: "",                                     model: "", models: [] }
+  "mimo-tokenplan": { label: "小米 MiMo(Token Plan)", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", model: "mimo-v2.5", models: ["mimo-v2.5", "mimo-v2.5-pro"], vision: true },
+  "mimo":           { label: "小米 MiMo(标准 sk-)",  baseUrl: "https://api.xiaomimimo.com/v1",        model: "mimo-v2.5", models: ["mimo-v2.5", "mimo-v2.5-pro"], vision: true },
+  // DeepSeek：V4.1-Flash(模型名 deepseek-flash，2026-09-10 起)是原生多模态，
+  // 图直接进 user 消息的 content 数组；旧的 deepseek-chat / deepseek-reasoner
+  // 名字仍能调，但不吃图。老名字 deepseek-v4-flash / -vision-exp 一律路由到 V4.1 Flash。
+  "deepseek":       { label: "DeepSeek",              baseUrl: "https://api.deepseek.com/v1",          model: "deepseek-flash", models: ["deepseek-flash", "deepseek-v4-pro"], vision: true },
+  "openai":         { label: "OpenAI",                baseUrl: "https://api.openai.com/v1",            model: "gpt-4o-mini", models: ["gpt-4o-mini", "gpt-4o"], vision: true },
+  "ollama":         { label: "Ollama(本地)",          baseUrl: "http://127.0.0.1:11434/v1",            model: "qwen2.5:7b", models: ["qwen2.5:7b", "qwen2.5:14b"], vision: false },
+  "lmstudio":       { label: "LM Studio(本地)",       baseUrl: "http://127.0.0.1:1234/v1",             model: "local-model", models: [], vision: null },
+  "mock":           { label: "内置自测(mock)",        baseUrl: "http://127.0.0.1:8765/mock/v1",        model: "mock-model", models: ["mock-model"], vision: false },
+  "custom":         { label: "自定义(OpenAI 兼容)",   baseUrl: "",                                     model: "", models: [], vision: null }
 };
 
 const DEFAULT_SYS = "你是 Siemens Designcenter / NX 的 CAD 助手,用简体中文回答,给可直接照做的步骤。" +
@@ -61,7 +64,12 @@ function loadConfig() {
     python: raw.python || "python",
     toolTimeoutMs: raw.toolTimeoutMs || 60000,
     maxToolRounds: raw.maxToolRounds || 8,
+    maxToolCalls: Number(raw.maxToolCalls) || 14,
     cleanupOnNxExit: ["all", "scratch", "smart", "off"].includes(raw.cleanupOnNxExit) ? raw.cleanupOnNxExit : "all",
+    // 「一发即摘」:图只跟一条消息走,发出去就把待发送区腾空。默认开 —— 实测里主人
+    // 每轮都手动点 × 摘掉,那就别让人点。想连问同一张图,把它设成 false 即可。
+    imageOneShot: raw.imageOneShot !== false,
+    imageMaxSide: Number(raw.imageMaxSide) || 1600,
     colorTheme: raw.colorTheme || "light",
     locale: raw.locale || "en_US",
     version: raw.version || ""            // 空 = 用检测到的 release(不再写死 2606.1700)
@@ -95,7 +103,10 @@ function active(cfg) {
     label: preset.label || id,
     baseUrl: (p.baseUrl || preset.baseUrl || "").replace(/\/+$/, ""),
     apiKey: p.apiKey || "",
-    model: p.model || preset.model || ""
+    model: p.model || preset.model || "",
+    // 三态:true 确定能看图,false 确定不能,null 不确定。
+    // 配置里显式写 providers.<id>.vision 就覆盖预设 —— 换了个多模态模型时不必改代码。
+    vision: typeof p.vision === "boolean" ? p.vision : (preset.vision === undefined ? null : preset.vision)
   };
 }
 
@@ -547,6 +558,199 @@ function runNxSkill(cfg, args, timeoutMs, input) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 读图管线:文件选择 → 预处理 → 图像简报 → 送进模型
+ *
+ * 分工是刻意分开的:
+ *   · Node 只做搬运 —— 把浏览器上传的 base64 落盘、把路径变成工具参数;
+ *   · 真正的解码/缩放/增强/测量放在 Python 侧(nx_skill/images.py),因为
+ *     Pillow 与 numpy 装在宿主解释器里,而 NX 自带解释器既没有 pip 也没有
+ *     site-packages(实测 NXBIN\python 下只有 NXOpen*.pyd 与 Python311.zip)。
+ *   · 送进模型分两条路:能看图的供应商直接附 image_url(base64);不能看图的,
+ *     把「图像简报」当文本附上去,并明确告诉它自己看不到图 —— 不假装看过。
+ * ------------------------------------------------------------------ */
+const IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"];
+const IMAGE_MIME = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".bmp": "image/bmp",
+  ".gif": "image/gif", ".tif": "image/tiff", ".tiff": "image/tiff", ".webp": "image/webp"
+};
+
+// 错误码 → 人话。Python 侧给的是稳定的 code,这里只负责翻成主人看得懂的句子。
+const IMAGE_ERROR_TEXT = {
+  IMAGE_NOT_FOUND: "找不到这个图像文件",
+  IMAGE_UNSUPPORTED_FORMAT: "不是支持的图像格式(支持 PNG/JPG/BMP/GIF/TIFF/WebP)",
+  IMAGE_TOO_LARGE: "图像文件太大",
+  IMAGE_TOO_SMALL: "图像分辨率过低(短边小于 200 px,图纸上的尺寸字会读不准)",
+  IMAGE_DECODE_FAILED: "图像解码失败(文件可能损坏,或扩展名与内容不符)",
+  IMAGE_DEPENDENCY_MISSING: "本机 Python 缺少图像处理库(Pillow/numpy)",
+  IMAGE_TIMEOUT: "图像处理超时",
+  WORKSPACE_VIOLATION: "这个路径在工作区之外,而已被明确禁止",
+  INVALID_ARGUMENT: "图像参数不合法"
+};
+
+function nxWorkspaceDir(cfg) {
+  if (cfg.nxWorkspace) return cfg.nxWorkspace;
+  return path.join(require("os").homedir(), "NXSkillWorkspace");
+}
+
+/** 跑一次 nx-skill CLI 并解析信封;拿不到信封就抛错,不静默当成功。 */
+function nxSkillJson(cfg, args, timeoutMs, input) {
+  return runNxSkill(cfg, args, timeoutMs, input).then((r) => {
+    if (r.envelope) return r.envelope;
+    throw new Error("nx-skill " + args.join(" ") + " 没有返回可解析的结果:" + (r.stderr || r.raw || "exit " + r.code));
+  });
+}
+
+/** 把浏览器上传的 data URL 落到工作区(工作区外一律不写)。 */
+function saveDataUrl(cfg, dataUrl, name) {
+  const m = /^data:image\/[A-Za-z0-9.+-]+;base64,([A-Za-z0-9+/=\r\n]+)$/.exec(String(dataUrl || "").trim());
+  if (!m) throw new Error("图像数据不是 data:image/...;base64 格式");
+  const buf = Buffer.from(m[1].replace(/\s+/g, ""), "base64");
+  if (!buf.length) throw new Error("图像数据为空");
+  if (buf.length > 40 * 1024 * 1024) throw new Error("图像超过 40 MB 上限(实际 " + (buf.length / 1048576).toFixed(1) + " MB)");
+  const safe = (String(name || "pasted").replace(/[^A-Za-z0-9._-]/g, "_") || "pasted").slice(-80);
+  const ext = path.extname(safe).toLowerCase();
+  const dir = path.join(nxWorkspaceDir(cfg), "images");
+  fs.mkdirSync(dir, { recursive: true });
+  const target = path.join(dir, IMAGE_EXTS.includes(ext) ? safe : safe + ".png");
+  fs.writeFileSync(target, buf);
+  return { path: target, bytes: buf.length };
+}
+
+/** 把一条图像简报写成模型读得懂的文本(给看不到图的供应商用)。 */
+function imageBriefText(brief, opts) {
+  const o = opts || {};
+  const f = (brief && brief.file) || {};
+  const lines = [];
+  lines.push("【图像输入 · 由本机图像管线读出,不是模型看到的像素】");
+  lines.push("- 文件:" + (f.fileName || "?") + " / " + (f.format || "?") + " / " + (f.width || "?") + "x" + (f.height || "?")
+    + " px / " + ((f.sizeBytes || 0) / 1024).toFixed(0) + " KB"
+    + (f.megapixels ? " / " + f.megapixels + " MP" : "")
+    + (f.aspect ? " / 宽高比 " + f.aspect : "")
+    + (f.dpi ? " / " + Math.round(f.dpi) + " dpi" : ""));
+  if (o.prepared) {
+    lines.push("- 预处理:" + (o.prepared.path || "") + "(已 " + (o.prepared.steps || []).join(" → ") + ")");
+  }
+  const m = (brief && brief.measurements) || null;
+  if (m && m.available) {
+    lines.push("- 墨迹占比 " + m.inkRatio + ",边缘密度 " + m.edgeDensity + ",灰度均值 " + m.meanGray + "/标准差 " + m.stdGray);
+    if (Array.isArray(m.inkGrid)) {
+      lines.push("- 版面墨迹图(16x16,`.`几乎空白 / `o`有线条 / `#`密集 —— 用来判断视图与标题栏位置):");
+      m.inkGrid.forEach((row, i) => lines.push("    " + String(i).padStart(2, "0") + " " + row));
+    }
+  } else if (m) {
+    lines.push("- 量化测量不可用:" + (m.reason || "未知原因"));
+  }
+  const s = (brief && brief.scale) || null;
+  if (s && s.mmPerPixel) {
+    lines.push("- 比例尺:" + s.mmPerPixel + " " + s.unit + "/px(来自调用方给的已知尺寸;误差 " + s.uncertainty + ")");
+  } else {
+    lines.push("- 比例尺:**没有**。呼叫方没给已知尺寸,所以不要推断任何物理尺寸。");
+  }
+  (f.warnings || []).forEach((w) => lines.push("- 警告:" + w));
+  lines.push("");
+  lines.push("要求:先确认投影角(第一/第三角)再读视图;尺寸以图上的标注文字为准,不要量线长当尺寸;");
+  lines.push("读不出来或不确定的尺寸,要在 NX 里做成可编辑表达式,而不是猜一个数。");
+  return lines.join("\n");
+}
+
+/**
+ * 这个路径是不是「工作区里已经预处理过的图」?
+ *
+ * 工作台选完图会先调一次 /api/image/prepare 做预览,提问时再把那张**已经处理过**的
+ * 文件路径发回来。再预处理一遍纯属浪费 —— 实测会多出一个 06_1600_1600.jpg。
+ * 只认工作区 images/ 下的文件,别的地方一律照旧处理。
+ */
+function preparedWorkspaceImage(cfg, target) {
+  try {
+    const base = path.resolve(nxWorkspaceDir(cfg), "images");
+    const resolved = path.resolve(String(target));
+    return resolved.startsWith(base + path.sep) && fs.existsSync(resolved) && fs.statSync(resolved).isFile();
+  } catch (e) { return false; }
+}
+
+/**
+ * 一个图像从「用户给的」变成「能送进模型的」。
+ * 输入 {path} 或 {dataUrl,name};输出统一信封,失败也返回而不是抛。
+ */
+async function readImageForModel(cfg, image, opts) {
+  const o = opts || {};
+  const maxSide = Math.min(4096, Math.max(320, Number(o.maxSide) || 1600));
+  const out = { ok: false, code: null, message: null, stored: null, prepared: null, brief: null, dataUrl: null, briefText: null, warnings: [], reused: false };
+  try {
+    let sourcePath = String((image && image.path) || "").trim();
+    if (!sourcePath) {
+      if (!image || !image.dataUrl) throw new Error("没有图像:需要 path 或 dataUrl");
+      out.stored = saveDataUrl(cfg, image.dataUrl, image.name);
+      sourcePath = out.stored.path;
+    }
+    // 复用要客户端明说(reusePrepared),再叠加「必须落在工作区 images/ 下」这道护栏:
+    // 光看路径会误判 —— 工作台把上传的原图也存在同一个目录里。
+    const reuse = o.reusePrepared === true && preparedWorkspaceImage(cfg, sourcePath);
+    if (reuse) {
+      // 复用:只补一次简报,不再转换(省一次 Pillow 往返,也不再产出 *_1600.jpg 这种叠名字)。
+      const buffer = fs.readFileSync(sourcePath);
+      const ext = path.extname(sourcePath).toLowerCase();
+      const mime = IMAGE_MIME[ext] || "image/jpeg";
+      out.reused = true;
+      out.prepared = {
+        source: sourcePath,
+        path: path.relative(nxWorkspaceDir(cfg), sourcePath).replace(/\\/g, "/"),
+        absolutePath: sourcePath,
+        format: ext.replace(".", ""),
+        mime,
+        bytes: buffer.length,
+        steps: ["reused already-prepared workspace image"],
+        warnings: [],
+        probe: null
+      };
+      out.dataUrl = "data:" + mime + ";base64," + buffer.toString("base64");
+      out.warnings = [];
+    } else {
+      const args = ["image", "prepare", sourcePath, "--max-side", String(maxSide), "--fmt", o.fmt || "jpeg", "--inline"];
+      if (o.grayscale) args.push("--grayscale");
+      const prep = await nxSkillJson(cfg, args, Math.max(15000, cfg.toolTimeoutMs || 60000));
+      if (!prep.ok) {
+        out.code = ((prep.error || {}).code) || "IMAGE_ERROR";
+        out.message = ((prep.error || {}).message) || "图像预处理失败";
+        out.warnings.push((prep.error || {}).suggestion || "");
+        return out;
+      }
+      out.prepared = prep.result;
+      out.dataUrl = prep.result.dataUrl || null;
+      out.warnings = (prep.result.warnings || []).slice();
+    }
+
+    // 简报单独再跑一次 read:即使模型能看图,简报里的测量值也值得一起给它。
+    const known = o.knownDimension && o.knownDimension.pixels && o.knownDimension.value ? o.knownDimension : null;
+    const readArgs = ["image", "read", out.prepared.absolutePath || sourcePath];
+    if (known) readArgs.push("--known-pixels", String(known.pixels), "--known-value", String(known.value), "--known-unit", String(known.unit || "mm"));
+    const read = await nxSkillJson(cfg, readArgs, Math.max(15000, cfg.toolTimeoutMs || 60000));
+    if (read.ok) out.brief = read.result;
+    else out.warnings.push("图像简报失败:" + (((read.error || {}).message) || ""));
+
+    out.briefText = imageBriefText(out.brief || { file: out.prepared.probe }, { prepared: out.prepared });
+    out.ok = true;
+    return out;
+  } catch (e) {
+    out.code = "IMAGE_PIPELINE_ERROR";
+    out.message = e.message;
+    return out;
+  }
+}
+
+function imageFailureText(r) {
+  const label = IMAGE_ERROR_TEXT[r.code] || "图像处理失败";
+  const extra = r.message ? "(" + String(r.message).slice(0, 300) + ")" : "";
+  let hint = "";
+  if (r.code === "IMAGE_TOO_SMALL") hint = " 建议按 600 dpi 以上重新导出,或把图纸分块扫描。";
+  else if (r.code === "IMAGE_UNSUPPORTED_FORMAT") hint = " 支持 PNG/JPG/BMP/GIF/TIFF/WebP;PDF 请先导出成 PNG。";
+  else if (r.code === "IMAGE_NOT_FOUND") hint = " 检查路径,或在对话框里重新选一次。";
+  else if (r.code === "IMAGE_DEPENDENCY_MISSING") hint = " 在宿主解释器里执行 pip install pillow numpy。";
+  return "<p><b>读图失败:</b>" + esc(label) + esc(extra) + "</p><p>" + esc(hint) + "</p>"
+    + (r.warnings && r.warnings.length ? "<p class='hint'>" + esc(r.warnings.join(" ")) + "</p>" : "");
+}
+
+/* ------------------------------------------------------------------ *
  * NXOpen API 名门禁
  * 模型很容易写出"看着像但不存在"的 NXOpen 调用(例如 NXOpen.Sketches.Xxx、
  * NXOpen.Sketch.ViewReorient.TrueValue)。这类脚本会在用户点执行时才炸。
@@ -681,7 +885,7 @@ function checkNxOpenImports(script) {
 
 /** 用宿主 Python 对 journal 脚本做语法检查(只编译,不执行) */function checkPythonSyntax(file) {
   const { spawnSync } = require("child_process");
-  const r = spawnSync("python", ["-c", "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)", file],
+  const r = spawnSync((loadConfig().python || "python"), ["-c", "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)", file],
     { encoding: "utf8", windowsHide: true });
   if (r.status === 0) return { ok: true };
   const msg = ((r.stderr || "") + (r.stdout || "")).trim();
@@ -920,6 +1124,11 @@ async function chatOnce(cfg, messages, opts) {
   if (a.apiKey) headers["Authorization"] = "Bearer " + a.apiKey;
   const body = { model: a.model || "gpt-4o-mini", messages, stream: false };
 
+  // 单次模型调用超时。没有它,供应商吊住连接就是无限等待 —— 界面只会停在
+  // "正在接收回答"。带上图像的请求本身就更重,所以把上限做成可配置。
+  const timeoutMs = Math.max(5000, Number(cfg.llmTimeoutMs) || Number(opts && opts.timeoutMs) || 180000);
+  const signal = AbortSignal.timeout(timeoutMs);
+
   // 深度思考开关。MiMo 官方文档明确:调 tool 时开着 thinking 会导致
   // tool_calls 出现在 reasoning 里(不稳定输出)—— 实测就是这个让模型把
   // 工具调用当文本吐出来。默认:调工具时关,纯生成时也关(提速)。
@@ -940,7 +1149,7 @@ async function chatOnce(cfg, messages, opts) {
   // 默认流式:只有流式才能把 reasoning_content(思考链)实时亮出来,
   // 否则用户要干等几十秒,分不清是卡住还是在思考。
   if (opts && opts.stream === false) {
-    const res0 = await fetch(a.baseUrl + "/chat/completions", { method: "POST", headers, body: JSON.stringify(body) });
+    const res0 = await fetch(a.baseUrl + "/chat/completions", { method: "POST", headers, body: JSON.stringify(body), signal });
     if (!res0.ok) { const t = await res0.text(); throw new Error("模型接口 " + res0.status + ": " + t.slice(0, 300)); }
     const j0 = await res0.json();
     try {
@@ -951,7 +1160,7 @@ async function chatOnce(cfg, messages, opts) {
   }
 
   body.stream = true;
-  const res = await fetch(a.baseUrl + "/chat/completions", { method: "POST", headers, body: JSON.stringify(body) });
+  const res = await fetch(a.baseUrl + "/chat/completions", { method: "POST", headers, body: JSON.stringify(body), signal });
   if (!res.ok) { const t = await res.text(); throw new Error("模型接口 " + res.status + ": " + t.slice(0, 300)); }
   if (!res.body) { // 不支持流式就退回
     const j1 = await res.json();
@@ -1026,9 +1235,42 @@ function renderTrace(trace) {
 /** 有些供应商(实测 MiMo)偶尔把工具调用当普通文本吐出来:
  *  <tool_call><function=N><parameter=k>v</parameter></function></tool_call>
  *  这里兜底解析,避免整轮白跑。 */
+/**
+ * 文本形式的工具调用。两种都要认,因为它们在 content 里而不是 tool_calls 字段:
+ *   1) 旧的 function/parameter 文本形式;
+ *   2) DeepSeek 的 DSML 形式 —— 全角竖线包住标记,形如 DSML 竖线 invoke name="nx_status"。
+ * 实测(2026-09-21):带图提问时 deepseek-chat 会把整段 DSML 写进正文。不认它后果是双重的
+ * —— 工具没被执行,而且那几千字裸标记会原样漏给主人。
+ */
+const DSML_BAR = String.fromCharCode(0xFF5C);        // 全角竖线
+const DSML_TAG = DSML_BAR + DSML_BAR + 'DSML' + DSML_BAR + DSML_BAR;
+
 function parseTextToolCalls(content) {
   const out = [];
-  if (typeof content !== "string" || content.indexOf("<function=") < 0) return out;
+  if (typeof content !== 'string') return out;
+
+  // 形式二:DSML(先做,因为它可能和形式一同现)
+  if (content.indexOf(DSML_TAG) >= 0) {
+    const chunks = content.split(new RegExp('<' + DSML_TAG + 'invoke[ >]'));
+    for (let i = 1; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const head = chunk.match(/^name="([A-Za-z0-9_]+)"/) || chunk.match(/^([A-Za-z0-9_]+)"/);
+      const name = head ? head[1] : '';
+      if (!name) continue;
+      const args = {};
+      const paramRe = new RegExp(DSML_TAG + 'parameter name="([A-Za-z0-9_]+)"[^>]*>([\\s\\S]*?)</' + DSML_TAG + 'parameter>', 'g');
+      let p;
+      while ((p = paramRe.exec(chunk)) !== null) {
+        const raw = p[2].trim();
+        try { args[p[1]] = JSON.parse(raw); } catch (e) { args[p[1]] = raw; }
+      }
+      out.push({ id: 'dsml_' + out.length + '_' + Date.now(), type: 'function', function: { name, arguments: JSON.stringify(args) } });
+      console.log('[ask] 从 DSML 文本里解析出工具调用:' + name);
+    }
+    if (out.length) return out;
+  }
+
+  if (content.indexOf('<function=') < 0) return out;
   const fnRe = /<function=([A-Za-z0-9_]+)>([\s\S]*?)<\/function>/g;
   let m;
   while ((m = fnRe.exec(content)) !== null) {
@@ -1043,9 +1285,32 @@ function parseTextToolCalls(content) {
       try { v = JSON.parse(raw); } catch (e) { /* 保留字符串 */ }
       args[p[1]] = v;
     }
-    out.push({ id: "textcall_" + out.length + "_" + Date.now(), type: "function", function: { name, arguments: JSON.stringify(args) } });
+    out.push({ id: 'textcall_' + out.length + '_' + Date.now(), type: 'function', function: { name, arguments: JSON.stringify(args) } });
   }
   return out;
+}
+
+/** 把残留的工具调用标记从正文里摘掉 —— 用户不该看到裸标记。 */
+function stripToolMarkup(input) {
+  let text = String(input || '');
+  if (text.indexOf(DSML_TAG) >= 0) {
+    text = text.replace(new RegExp('<' + DSML_TAG + 'invoke[\\s\\S]*?</' + DSML_TAG + 'invoke>', 'g'), '');
+    text = text.replace(new RegExp(DSML_TAG + '[^\\n]*', 'g'), '');
+  }
+  text = text
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
+    .replace(/<function=[A-Za-z0-9_]+>[\s\S]*?<\/function>/g, '')   // 整块删,别把参数值留在正文
+    .replace(/<\/?function[^>]*>/g, '')
+    .replace(/<\/?parameter[^>]*>/g, '');
+
+  // 标记被截断或折行时会留下碎片:单独成行的 < 、 </ 、 | 、 ｜ 。
+  // 实测 2026-09-21:回答末尾吊着 "< < < / </" 五行,因为输出在半个标记处被截断。
+  // 只削**结尾**那些"全是标记符号"的行,并且不含 '-' —— markdown 的 --- 分隔线不能被吃掉。
+  const lines = text.split('\n');
+  const debris = /^[\s<>/|\uFF5C]{1,8}$/;
+  while (lines.length && debris.test(lines[lines.length - 1])) lines.pop();
+  while (lines.length && lines[0].trim() === '') lines.shift();
+  return lines.join('\n').trim();
 }
 
 /** 计划刚载入队列时,在答案最上方插一条醒目指路条 */
@@ -1057,26 +1322,82 @@ function renderReviewBanner(submitted, stepCount) {
     "或按 <b>Ctrl+Alt+Shift+R</b>。每步可单独撤销、自动截图留痕；计划<b>不会自动运行</b>。</div></div>";
 }
 
-async function answer(question, cfg, history = []) {
+/**
+ * 构造 user 消息的内容。
+ *
+ * 能看图的供应商拿到标准的 OpenAI 多模态 content 数组(text + image_url);
+ * 看不到图的供应商拿到「提问 + 图像简报」的纯文本,并且简报第一行就写明
+ * 这不是它看到的像素 —— 模型不会假装看过图,主人也不会被"我看到了"骗到。
+ */
+function buildUserContent(question, a, img) {
+  if (!img) return question;
+  if (!img.ok) return question;
+
+  const brief = img.briefText || "【图像输入】";
+  if (a.vision === true && img.dataUrl) {
+    return [
+      { type: "text", text: question + "\n\n" + brief },
+      { type: "image_url", image_url: { url: img.dataUrl, detail: "high" } }
+    ];
+  }
+  const why = a.vision === null
+    ? "(当前供应商 " + a.label + " 的看图能力未声明,按保守处理;确实支持多模态时可在 config.json 的 providers."
+      + a.id + ".vision 写 true。)"
+    : "(当前模型 " + a.label + " 不能读图,以下是本机图像管线读出来的结构化简报。)";
+  return question + "\n\n" + why + "\n\n" + brief;
+}
+
+/**
+ * 保证每个 assistant.tool_calls 里的 id 都有对应的 tool 回复。
+ *
+ * 供应商按协议校验这件事:少一条回复,整个请求被 400 拒掉,而且报错文案
+ * (insufficient tool messages following tool_calls message)看不出是哪一轮造成的。
+ * 实测 2026-09-21 就是因为额度在中途用完、后面几条没回,整轮对话直接报后端错。
+ * 与其在每处 break 上小心翼翼,不如发请求前统一补齐。
+ */
+function repairToolPairing(messages) {
+  const answered = new Set(messages.filter(m => m.role === "tool").map(m => m.tool_call_id));
+  const out = [];
+  for (const message of messages) {
+    out.push(message);
+    if (message.role === "assistant" && Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        if (call && call.id && !answered.has(call.id)) {
+          answered.add(call.id);
+          out.push({
+            role: "tool", tool_call_id: call.id, name: call.function && call.function.name,
+            content: JSON.stringify({ error: "本条未执行(工具额度或收敛限制),请改用已有信息作答。" })
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+async function answer(question, cfg, history = [], image = null) {
   const a = active(cfg);
   const trace = [];
   progressStart("chat", question);
   try {
-    return await answerInner(question, cfg, a, trace, history);
+    return await answerInner(question, cfg, a, trace, history, image);
   } finally {
     progressEnd("done");
   }
 }
 
-async function answerInner(question, cfg, a, trace, history) {
+async function answerInner(question, cfg, a, trace, history, imageResult) {
 
   if (a.id === "mock" && !question) { /* 不会发生 */ }
 
   const messages = [
     { role: "system", content: cfg.systemPrompt || DEFAULT_SYS },
     { role: "system", content: "本机信息必须以工具返回为准。回答当前工作零件或验证执行结果时调用 nx_live_status；读取失败就明确说无法核实。计划提交只表示已进入复核队列，不代表 NX 执行成功。NXOpen API 名称请先查本机文档。" },
+    { role: "system", content: "只有工具真的返回成功才算做过。不要在正文里写「已提交」「已调用」「已执行」——系统记录才是判据,你写了也没用,还会误导用户。" },
+    { role: "system", content: "收到图像时：先看图像工具的测量值再下结论。图上的尺寸以标注文字为准，不要拿线长当尺寸。本项目里 nx_image_read / nx_image_prepare 负责读图，nx_visual_spec 给出三视图建模规则。"
+        + "没有已知尺寸时，任何物理尺寸都是不确定的——要么向你询问参考尺寸，要么在计划里做成可编辑表达式。" },
     ...history,
-    { role: "user", content: question }
+    { role: "user", content: buildUserContent(question, a, imageResult) }
   ];
   const seen = new Map();     // 去重:同工具同参数不重复执行
   const used = {};            // 每个工具已用次数(超过额度就从工具表摘掉)
@@ -1088,7 +1409,7 @@ async function answerInner(question, cfg, a, trace, history) {
   for (let i = 0; i <= maxRounds; i++) {
     const schemas = availableSchemas(cfg, used);
     const noMoreTools = i === maxRounds || callCount >= maxCalls || schemas.length === 0;
-    const j = await chatOnce(cfg, messages, noMoreTools ? { tools: false } : { tools: true, schemas });
+    const j = await chatOnce(cfg, repairToolPairing(messages), noMoreTools ? { tools: false } : { tools: true, schemas });
     const msg = (j.choices && j.choices[0] && j.choices[0].message) || {};
     let calls = msg.tool_calls || [];
 
@@ -1098,7 +1419,7 @@ async function answerInner(question, cfg, a, trace, history) {
       if (salvaged.length) {
         console.log("[ask] 兜底解析出文本形式的工具调用 " + salvaged.length + " 个");
         calls = salvaged;
-        msg.content = String(msg.content).replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
+        msg.content = stripToolMarkup(msg.content);
       }
     }
 
@@ -1108,7 +1429,16 @@ async function answerInner(question, cfg, a, trace, history) {
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: calls });
 
     for (const c of calls) {
-      if (callCount >= maxCalls) break;
+      if (callCount >= maxCalls) {
+        // 额度用完也必须回一条 tool 消息:OpenAI 兼容接口要求每个 tool_call_id
+        // 都有对应的 tool 回复,少一条整个请求就是 400
+        // ("insufficient tool messages following tool_calls message")。
+        messages.push({
+          role: "tool", tool_call_id: c.id, name: c.function.name,
+          content: JSON.stringify({ error: "工具调用额度已用完,本条未执行。请用已有信息作答。" })
+        });
+        continue;
+      }
       let args = {}; try { args = JSON.parse(c.function.arguments || "{}"); } catch (e) { }
       const key = c.function.name + ":" + JSON.stringify(args);
       let r;
@@ -1143,7 +1473,7 @@ async function answerInner(question, cfg, a, trace, history) {
     // 最终兜底:不带 tools 再要一次纯文本
     messages.push({ role: "system", content: "现在只用已经拿到的信息,用简体中文给出完整回答;如果用户要求提交计划而还没提交,请把它做完。" });
     try {
-      const j2 = await chatOnce(cfg, messages, { tools: false });
+      const j2 = await chatOnce(cfg, repairToolPairing(messages), { tools: false });
       let c2 = ((j2.choices || [{}])[0].message || {}).content || "";
       // 最后一搏:模型把工具调用写成文本时,这里真的执行掉(通常就是 nx_review_submit)
       const late = parseTextToolCalls(c2);
@@ -1157,12 +1487,8 @@ async function answerInner(question, cfg, a, trace, history) {
     } catch (e) { }
   }
   // 收尾:把残留的工具调用标记从正文清掉,别让用户看到裸标签
-  if (final) {
-    final = String(final)
-      .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
-      .replace(/<\/?function[^>]*>/g, "")
-      .replace(/<\/?parameter[^>]*>/g, "")
-      .trim();
+  if (final && (final.indexOf(DSML_TAG) >= 0 || final.indexOf('<function=') >= 0 || final.indexOf('<tool_call>') >= 0)) {
+    final = stripToolMarkup(final);
   }
   if (!final) final = "（模型未能在额度内给出文本答复。请把问题拆小,或把「最大工具调用数」调大后重试。）";
 
@@ -1298,6 +1624,8 @@ const sendJson = (res, o) => { res.writeHead(200, { "Content-Type": "application
 
 /* 最近的请求记录,便于判断"NX 是否真的连上了我们" */
 const RECENT = [];
+/* NX 菜单里选好的图先放这儿,工作台打开时自己取走(取一次就清空)。 */
+let PENDING_IMAGE = null;
 function note(req, extra) {
   const ua = String(req.headers["user-agent"] || "");
   const from = /WebView2|Edg\//i.test(ua) ? "WebView2/NX" : (ua.slice(0, 30) || "?");
@@ -1322,7 +1650,7 @@ const server = http.createServer(async (req, res) => {
       const noTools = body.tool_choice === "none";
       let out;
       if (hasTools && !noTools && !toolMsgs.length) {
-        const q = (lastUser && lastUser.content) || "";
+        const q = String((lastUser && lastUser.content) || "");
         const call = /NXOpen|API|成员|类型/.test(q) ? { name: "nx_docs_search", args: { query: "ExtrudeBuilder" } } : { name: "nx_status", args: {} };
         out = { role: "assistant", content: null, tool_calls: [{ id: "call_mock_1", type: "function", function: { name: call.name, arguments: JSON.stringify(call.args) } }] };
       } else if (toolMsgs.length) {
@@ -1335,13 +1663,71 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  /* ---- 读图交接:NX 菜单选的图交给工作台 ---- */
+  if (parsed.pathname === "/api/image/handoff") {
+    if (req.method === "POST") {
+      readBody(req, (raw) => {
+        let body = {}; try { body = JSON.parse(raw || "{}"); } catch (e) { }
+        const target = String(body.path || "").trim();
+        if (!target || !fs.existsSync(target)) { sendJson(res, { ok: false, error: "路径不存在:" + target }); return; }
+        PENDING_IMAGE = { path: target, at: Date.now() };
+        console.log("[handoff] NX 交来一张图:" + target);
+        sendJson(res, { ok: true, path: target });
+      });
+    } else {
+      // 超过 10 分钟的交接当过期:没人会隔那么久才回来取。
+      const fresh = PENDING_IMAGE && (Date.now() - PENDING_IMAGE.at) < 10 * 60 * 1000;
+      const pending = fresh ? PENDING_IMAGE.path : null;
+      PENDING_IMAGE = null;
+      sendJson(res, { ok: true, path: pending });
+    }
+    return;
+  }
+
+  /* ---- 读图:预处理 + 简报(界面预览与"这条图能不能看懂"的判断) ---- */
+  if (req.method === "POST" && parsed.pathname === "/api/image/prepare") {
+    readBody(req, async (raw) => {
+      let body = {}; try { body = JSON.parse(raw || "{}"); } catch (e) { }
+      const cfg = loadConfig();
+      const img = await readImageForModel(cfg, body.image || body, body.options || {});
+      if (!img.ok) {
+        sendJson(res, {
+          ok: false, code: img.code, message: img.message,
+          hint: IMAGE_ERROR_TEXT[img.code] || null, warnings: img.warnings, html: imageFailureText(img)
+        });
+        return;
+      }
+      const a = active(cfg);
+      sendJson(res, {
+        ok: true,
+        prepared: {
+          path: img.prepared.path, absolutePath: img.prepared.absolutePath,
+          width: img.prepared.width, height: img.prepared.height, bytes: img.prepared.bytes,
+          mime: img.prepared.mime, steps: img.prepared.steps
+        },
+        brief: img.brief,
+        briefText: img.briefText,
+        warnings: img.warnings,
+        preview: img.dataUrl,
+        vision: {
+          supported: a.vision === true, unknown: a.vision === null,
+          provider: a.id, label: a.label, model: a.model,
+          route: a.vision === true ? "vision" : "brief"
+        }
+      });
+    });
+    return;
+  }
+
   /* ---- 聊天后端 ---- */
   if (req.method === "POST" && parsed.pathname === "/api/ask") {
     readBody(req, async (raw) => {
-      let q = "", history = [];
+      let q = "", history = [], image = null, imageOptions = {};
       try {
         const body = JSON.parse(raw || "{}");
         q = String(body.question || "").slice(0, 12000);
+        image = body.image || null;
+        imageOptions = body.imageOptions || {};
         if (Array.isArray(body.history)) history = body.history.slice(-8)
           .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
           .map(m => ({ role: m.role, content: m.content.slice(0, 4000) }));
@@ -1349,11 +1735,41 @@ const server = http.createServer(async (req, res) => {
       const cfg = loadConfig();
       const t0 = Date.now();
       try {
-        const a = await answer(q, cfg, history);
-        console.log("[ask] 问题:" + q.slice(0, 40) + " | 供应商:" + a.provider + " | 工具:" + a.trace.length + " | " + (Date.now() - t0) + "ms");
-        sendJson(res, { data: { answer: a.html, text: a.text }, meta: { provider: a.provider, model: a.model, ms: Date.now() - t0, tools: a.trace.length, reviewSubmitted: !!a.reviewSubmitted, stepCount: a.stepCount || null } });
+        // 读图在提问之前完成:失败了就直接把失败原因答复给主人,而不是让模型
+        // 凭空猜图里有什么。
+        let img = null;
+        if (image) {
+          if (PROGRESS.active) progressStage("tool", "读图:预处理 + 测量…");
+          img = await readImageForModel(cfg, image, imageOptions);
+          if (!img.ok) {
+            const ms = Date.now() - t0;
+            console.log("[ask] 读图失败:" + img.code + " | " + ms + "ms");
+            sendJson(res, {
+              data: { answer: imageFailureText(img), text: (IMAGE_ERROR_TEXT[img.code] || "读图失败") + " " + (img.message || "") },
+              meta: { ms, image: { ok: false, code: img.code } }
+            });
+            return;
+          }
+        }
+        const a = await answer(q, cfg, history, img);
+        const vision = active(cfg).vision === true;
+        console.log("[ask] 问题:" + q.slice(0, 40) + " | 供应商:" + a.provider + " | 工具:" + a.trace.length
+          + (img ? " | 图:" + (vision ? "多模态" : "简报") : "") + " | " + (Date.now() - t0) + "ms");
+        sendJson(res, {
+          data: { answer: a.html, text: a.text },
+          meta: {
+            provider: a.provider, model: a.model, ms: Date.now() - t0, tools: a.trace.length,
+            reviewSubmitted: !!a.reviewSubmitted, stepCount: a.stepCount || null,
+            image: img ? { ok: true, path: img.prepared.path, route: vision ? "vision" : "brief", warnings: img.warnings } : null
+          }
+        });
       } catch (e) {
-        sendJson(res, { data: { answer: "<p><b>后端出错:</b>" + esc(e.message) + "</p>" }, meta: { ms: Date.now() - t0 } });
+        const aborted = e && (e.name === "TimeoutError" || e.name === "AbortError");
+        const msg = aborted
+          ? "模型调用超时(超过 " + ((cfg.llmTimeoutMs || 180000) / 1000) + " 秒未返回)。可以调大 config.json 的 llmTimeoutMs,或换更快/更小的模型再试。"
+          : e.message;
+        console.log("[ask] 失败:" + msg);
+        sendJson(res, { data: { answer: "<p><b>" + (aborted ? "AI 调用超时" : "后端出错") + ":</b>" + esc(msg) + "</p>" }, meta: { ms: Date.now() - t0, error: aborted ? "LLM_TIMEOUT" : "BACKEND_ERROR" } });
       }
     });
     return;
@@ -1366,13 +1782,16 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, {
       ok: true,
       activeProvider: cfg.activeProvider,
-      active: { id: a.id, label: a.label, baseUrl: a.baseUrl, model: a.model, apiKeyMasked: mask(a.apiKey), hasKey: !!a.apiKey },
+      active: { id: a.id, label: a.label, baseUrl: a.baseUrl, model: a.model, apiKeyMasked: mask(a.apiKey), hasKey: !!a.apiKey, vision: a.vision },
       providers: Object.entries(PRESETS).map(([id, p]) => {
         const cur = cfg.providers[id] || {};
         return { id, label: p.label, presetBaseUrl: p.baseUrl, presetModel: p.model, models: p.models || [],
                  baseUrl: cur.baseUrl || p.baseUrl || "", model: cur.model || p.model || "", hasKey: !!cur.apiKey, apiKeyMasked: mask(cur.apiKey) };
       }),
       systemPrompt: cfg.systemPrompt,
+      image: { oneShot: cfg.imageOneShot, maxSide: cfg.imageMaxSide },
+      // 工具额度:状态栏上方那一条直接读这里。三个都可以在页面上改,不用开 config.json。
+      tool: { maxToolRounds: cfg.maxToolRounds, maxToolCalls: cfg.maxToolCalls, toolTimeoutMs: cfg.toolTimeoutMs },
       nx: {
         nxSkillRoot: cfg.nxSkillRoot, nxRoot: cfg.nxRoot, nxWorkspace: cfg.nxWorkspace,
         maxToolRounds: cfg.maxToolRounds, toolTimeoutMs: cfg.toolTimeoutMs,
@@ -1407,6 +1826,23 @@ const server = http.createServer(async (req, res) => {
       if (b.nx) {
         for (const k of ["nxSkillRoot", "nxRoot", "nxWorkspace"]) if (typeof b.nx[k] === "string") cfg[k] = b.nx[k].trim();
         if (b.nx.maxToolRounds) cfg.maxToolRounds = Number(b.nx.maxToolRounds) || 8;
+      }
+      // 状态栏上方那条「工具额度」单独发过来:只带 tool / image,不动供应商与提示词。
+      if (b.tool) {
+        const clamp = (value, low, high, fallback) => {
+          const n = Number(value);
+          return Number.isFinite(n) ? Math.min(high, Math.max(low, Math.round(n))) : fallback;
+        };
+        if (b.tool.maxToolRounds !== undefined) cfg.maxToolRounds = clamp(b.tool.maxToolRounds, 1, 50, cfg.maxToolRounds);
+        if (b.tool.maxToolCalls !== undefined) cfg.maxToolCalls = clamp(b.tool.maxToolCalls, 1, 80, cfg.maxToolCalls);
+        if (b.tool.toolTimeoutMs !== undefined) cfg.toolTimeoutMs = clamp(b.tool.toolTimeoutMs, 5000, 600000, cfg.toolTimeoutMs);
+      }
+      if (b.image) {
+        if (typeof b.image.oneShot === "boolean") cfg.imageOneShot = b.image.oneShot;
+        if (b.image.maxSide !== undefined) {
+          const n = Number(b.image.maxSide);
+          if (Number.isFinite(n)) cfg.imageMaxSide = Math.min(4096, Math.max(320, Math.round(n)));
+        }
       }
       saveConfig(cfg);
       sendJson(res, { ok: true });
@@ -1628,7 +2064,7 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, {
         ok: true,
         indexSize: idx.size,
-        syntax: (() => { const fsx = require("fs"), osx = require("os"); const f = path.join(osx.tmpdir(), "precheck_" + Date.now() + ".py"); fsx.writeFileSync(f, src, "utf8"); const r = require("child_process").spawnSync("python", ["-c", "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)", f], { encoding: "utf8", windowsHide: true }); try { fsx.unlinkSync(f); } catch (e) { } return r.status === 0 ? { ok: true } : { ok: false, error: ((r.stderr || "") + (r.stdout || "")).trim().split("\n").slice(-5).join("\n") }; })(),
+        syntax: (() => { const fsx = require("fs"), osx = require("os"); const f = path.join(osx.tmpdir(), "precheck_" + Date.now() + ".py"); fsx.writeFileSync(f, src, "utf8"); const r = require("child_process").spawnSync((loadConfig().python || "python"), ["-c", "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)", f], { encoding: "utf8", windowsHide: true }); try { fsx.unlinkSync(f); } catch (e) { } return r.status === 0 ? { ok: true } : { ok: false, error: ((r.stderr || "") + (r.stdout || "")).trim().split("\n").slice(-5).join("\n") }; })(),
         api: checkNxOpenNames(src),
         imports: checkNxOpenImports(src),
         builder: checkBuilderBooleanMembers(stripNonCode(src), idx)

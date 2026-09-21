@@ -35,6 +35,27 @@
 * `nx-skill` 侧:菜单/工具条、`.tbr` 关键字顺序修复、.NET 实时桥 `127.0.0.1` 补丁
 * 本 README、`nx-skill/docs/` 中的排障记录、以及全部踩坑归档
 
+**读图输入(2026-09-21)**
+
+把一张图纸截图、实物照片或参考图变成能建模的输入。设计上的分工是刻意的:
+**NX 只负责选图,Node 只负责搬运,Python 负责读图,模型负责理解** —— 因为
+`NXBIN/python` 既没有 pip 也没有 site-packages,第三方图像库根本装不进 NX。
+
+* `nx-skill/src/nx_skill/images.py` —— 探测 / 测量 / 预处理,核心是手工解析
+  PNG·JPEG·GIF·BMP·WebP·TIFF 头部(**纯标准库**),Pillow 与 numpy 只作为可选升级,
+  import 全部包在 `try/except` 里,并有 `test_optional_image_imports_are_guarded` 守着这个形状
+* 新增工具:`nx_image_capabilities` / `nx_image_read` / `nx_image_prepare`(MCP),
+  `nx-skill image caps|read|prepare`(CLI,信封与 MCP 一致)
+* `nx_runtime/application/read_drawing.py` + 菜单/按钮/工具条 —— NX 里
+  **`NX Skill → Read Drawing...`(`Ctrl+Alt+Shift+I`)**:NX 自带文件选择框
+  (`Ui.CreateFilebox`,原型取自本机 `UGOPEN/uf_ui.h`),失败退 `tkinter.filedialog`
+* 宿主侧读图管线:选图 → 预处理(旋正/灰度/自动对比/Lanczos/重编码)→ 结构化简报
+  (含 16×16 墨迹图) → **能看图的供应商走 `image_url` 多模态,不能看图的把简报当文本附上,
+  并明说「这不是你看到的像素」**。没有已知尺寸就不给任何物理尺寸
+* 顺带修掉三处实测缺陷:`spawnSync("python")` 没走配置导致脚本预检永远假报「语法有误」;
+  DeepSeek 的 DSML 文本形式工具调用既没被执行、又把几千字裸标记漏给用户;
+  工具额度中途用完导致 `tool_calls` 配不上 `tool` 回复而被接口 400 拒绝
+
 > **身份说明**:这是 AI 编程代理,不是 GitHub 账号,因此不会出现在 GitHub 的贡献者头像墙里。
 > 若希望它出现在那里,需要用某个真实账号的邮箱在提交里加 `Co-Authored-By:` trailer。
 

@@ -1,6 +1,14 @@
 VERSION 120
 CREATE BUTTON_DEFINITIONS
 
+BUTTON NX_SKILL_CONTROL_READ_DRAWING
+LABEL Read Drawing...
+TOOLBAR_LABEL Read Drawing
+MESSAGE Pick a drawing, photo or reference image: read it with the local image pipeline, print the measurements, and hand it to Copilot.
+NO_REPEAT
+ACCELERATOR Ctrl+Alt+Shift+I
+ACTIONS read_drawing.py
+
 BUTTON NX_SKILL_CONTROL_REVIEW_PLAN
 LABEL Review Plan
 TOOLBAR_LABEL Review Plan

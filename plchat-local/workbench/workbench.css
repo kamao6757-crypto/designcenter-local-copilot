@@ -183,6 +183,27 @@ summary:hover { color: var(--blue); }
 .input-hint { font-size: 10px; color: #62727e; }
 .composer-actions { display: flex; gap: 6px; }
 .composer-actions button { font-size: 12px; }
+/* 读图:待发送图像的预览条 + 拖放反馈。整条都在提问上方,移除按钮显眼,
+ * 因为"这张图会不会跟着下一条消息走"必须是能一眼看出来的事。 */
+.composer.drop-active { border-color: var(--teal); outline: 2px dashed var(--teal); outline-offset: -4px; }
+.image-attach { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--line); background: #f7f9fa; }
+.image-attach img { width: 64px; height: 64px; object-fit: contain; border: 1px solid var(--line); background: #fff; }
+.image-attach-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.image-attach-meta strong { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.image-attach-meta span { font-size: 10px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.image-route { color: var(--blue) !important; font-weight: 600; }
+.message-image { display: block; max-width: min(360px, 100%); max-height: 240px; margin-top: 8px; border: 1px solid var(--line); background: #fff; }
+/* 工具额度条:贴在状态栏上方。每次提问前最可能想调的一格,别埋进设置面板。 */
+.budget-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 5px 18px; border-top: 1px solid var(--line); background: #eef1f3; font-size: 11px; color: var(--muted); }
+.budget-label { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; color: var(--ink); }
+.budget-label svg { width: 13px; height: 13px; }
+.budget-field { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.budget-field input { width: 58px; padding: 2px 4px; border: 1px solid #8fa6b4; background: #fff; font-size: 11px; font-variant-numeric: tabular-nums; }
+.budget-field input:focus-visible { outline: 2px solid var(--blue); outline-offset: -1px; }
+.budget-check { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+#budget-save { padding: 2px 10px; font-size: 11px; }
+#budget-save:disabled { opacity: .5; }
+.budget-bar .field-feedback { margin: 0 0 0 auto; font-size: 11px; }
 .composer-actions svg { width: 15px; height: 15px; }
 .chat-footnote { flex-shrink: 0; padding: 7px 18px 9px; color: #687681; font-size: 10px; }
 .plan-context { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 13px 15px; border-bottom: 1px solid #e0e6ea; }

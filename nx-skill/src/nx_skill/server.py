@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import __version__
+from . import images as image_input
 from .config import Settings
 from .contracts import (
     InvalidArgument,
@@ -243,6 +244,111 @@ def _h_visual_spec(ctx: Context, args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+# -- image input -------------------------------------------------------------
+# A drawing is an *input*, not a model. These handlers read it, measure it and
+# normalise a copy into the workspace; they never claim a physical size the
+# picture does not carry, and they never write outside the workspace.
+
+
+def _h_image_capabilities(ctx: Context, args: dict[str, Any]) -> dict[str, Any]:
+    """Answer "can you even process an image here?" before promising anything."""
+    caps = image_input.capabilities()
+    return ok(
+        {
+            "interpreter": caps,
+            "workspace": str(ctx.workspace.root),
+            "limits": {
+                "maxBytes": image_input.DEFAULT_MAX_BYTES,
+                "maxSide": image_input.DEFAULT_MAX_SIDE,
+                "minSide": image_input.DEFAULT_MIN_SIDE,
+                "formats": list(image_input.SUPPORTED_SUFFIXES),
+                "writableFormats": list(image_input.WRITABLE_FORMATS),
+            },
+            "degrades": None
+            if caps["pillowAvailable"]
+            else "Pillow is missing in this interpreter: files can be read and copied but not converted, "
+            "enhanced or resized.",
+            "install": (
+                "Host interpreter: pip install pillow numpy. "
+                "OpenCV: pip install opencv-python-headless (only needed for deskew/line detection). "
+                "NX's embedded python has no pip and no site-packages — do the image work in the host "
+                "interpreter, not inside NX."
+            ),
+        }
+    )
+
+
+def _h_image_read(ctx: Context, args: dict[str, Any]) -> dict[str, Any]:
+    """Read a picture the user picked and describe what is actually in it."""
+    path = str(args.get("path") or "").strip()
+    if not path:
+        raise InvalidArgument(
+            "An image path is required.",
+            suggestion="The NX dialog or the workbench sends one; a path relative to the workspace also works.",
+        )
+    data = image_input.describe_image(
+        path,
+        allow_external=bool(args.get("allow_external", True)),
+        workspace=ctx.workspace,
+        max_bytes=int(args.get("max_bytes") or image_input.DEFAULT_MAX_BYTES),
+        min_side=int(args.get("min_side") or image_input.DEFAULT_MIN_SIDE),
+        allow_small=bool(args.get("allow_small", False)),
+        known_dimension=args.get("known_dimension"),
+        hints=args.get("hints") or (),
+    )
+    if args.get("inline"):
+        data["dataUrl"] = image_input.data_url_for(
+            data["file"]["path"], max_bytes=int(args.get("max_bytes") or image_input.DEFAULT_MAX_BYTES)
+        )
+    return ok(data)
+
+
+def _h_image_prepare(ctx: Context, args: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a copy into the workspace so a model request can carry it."""
+    path = str(args.get("path") or "").strip()
+    payload = str(args.get("data_url") or "").strip()
+    if not path and not payload:
+        raise InvalidArgument("Pass either path or data_url.", suggestion="One image, one source.")
+
+    if payload and not path:
+        saved = image_input.save_payload(
+            payload,
+            workspace=ctx.workspace,
+            name=str(args.get("name") or "pasted"),
+            max_bytes=int(args.get("max_bytes") or image_input.DEFAULT_MAX_BYTES),
+        )
+        path = saved["path"]
+        prepared = image_input.prepare_image(
+            path,
+            workspace=ctx.workspace,
+            max_side=int(args.get("max_side") or image_input.DEFAULT_MAX_SIDE),
+            fmt=str(args.get("fmt") or "jpeg"),
+            quality=int(args.get("quality") or 88),
+            grayscale=bool(args.get("grayscale")),
+            autocontrast=bool(args.get("autocontrast", True)),
+            allow_external=False,
+            allow_small=True,
+            inline=bool(args.get("inline")),
+        )
+        prepared["pastedFrom"] = {k: v for k, v in saved.items() if k != "probe"}
+        return ok(prepared)
+
+    return ok(
+        image_input.prepare_image(
+            path,
+            workspace=ctx.workspace,
+            max_side=int(args.get("max_side") or image_input.DEFAULT_MAX_SIDE),
+            fmt=str(args.get("fmt") or "jpeg"),
+            quality=int(args.get("quality") or 88),
+            grayscale=bool(args.get("grayscale")),
+            autocontrast=bool(args.get("autocontrast", True)),
+            allow_external=bool(args.get("allow_external", True)),
+            allow_small=bool(args.get("allow_small", True)),
+            inline=bool(args.get("inline")),
+        )
+    )
+
+
 def _h_prepare_session(ctx: Context, args: dict[str, Any]) -> dict[str, Any]:
     """One call that answers: where do I work, how do I route this, what are the rules."""
     prompt = args.get("prompt") or ""
@@ -405,10 +511,23 @@ def _h_review_clear(ctx: Context, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _h_live_call(ctx: Context, args: dict[str, Any]) -> dict[str, Any]:
-    """Escape hatch for the remaining bridge verbs, still whitelisted."""
+    """Escape hatch for the remaining bridge verbs, still whitelisted.
+
+    The verb is checked *here*, before the bridge is touched, so an unknown verb
+    is reported as INVALID_ARGUMENT whether or not the .NET client happens to be
+    built on this machine. Validating late (in :meth:`LiveBridge._invoke`, behind
+    ``require_client()``) made a fresh clone fail
+    ``test_live_call_rejects_an_unknown_verb`` with NX_BRIDGE_OFFLINE instead --
+    a bad argument must not be reported as an environment problem.
+    """
     command = str(args.get("command") or "").strip()
     if not command:
         raise InvalidArgument(f"command is required; one of {sorted(LIVE_COMMANDS)}")
+    if command not in LIVE_COMMANDS:
+        raise InvalidArgument(
+            f"Unknown live command {command!r}.",
+            suggestion=f"Expected one of: {', '.join(sorted(LIVE_COMMANDS))}",
+        )
     params = args.get("params") or {}
     if not isinstance(params, Mapping):
         raise InvalidArgument("params must be an object.")
@@ -565,6 +684,63 @@ TOOLS: tuple[Tool, ...] = (
         "Return the rules for building a model from a picture, blueprint or three-view drawing.",
         _object_schema({"prompt": _STR, "projection_system": _STR, "view_layout": _STR, "units": _STR}),
         _h_visual_spec,
+    ),
+    Tool(
+        "nx_image_capabilities",
+        "Report whether this interpreter can actually process images (Pillow/numpy), the workspace it would "
+        "write into, and the size/format limits. Call it before promising preprocessing.",
+        _object_schema({}),
+        _h_image_capabilities,
+    ),
+    Tool(
+        "nx_image_read",
+        "Read a picture the user picked (drawing scan, photo, reference image) and describe what is in it: "
+        "real format and pixel size, an ASCII ink map showing where the views and the title block sit, and "
+        "edge/ink measurements. Supply known_dimension={pixels,value,unit} to get a mm/px scale; without it no "
+        "physical size is claimed. Set inline=true to also receive a data URL for a vision model.",
+        _object_schema(
+            {
+                "path": _STR,
+                "allow_external": _BOOL,
+                "max_bytes": _INT,
+                "min_side": _INT,
+                "allow_small": _BOOL,
+                "known_dimension": {
+                    "type": "object",
+                    "properties": {"pixels": _NUM, "value": _NUM, "unit": _STR},
+                    "required": ["pixels", "value"],
+                    "additionalProperties": False,
+                },
+                "hints": {"type": "array", "items": _STR},
+                "inline": _BOOL,
+            },
+            ["path"],
+        ),
+        _h_image_read,
+    ),
+    Tool(
+        "nx_image_prepare",
+        "Normalise an image into the workspace for a model request: EXIF-rotate, optional grayscale and "
+        "autocontrast, fit inside max_side with Lanczos, re-encode as jpeg/png/webp. Accepts a path or a "
+        "data: URL. Returns the workspace-relative path (and a data URL when inline=true). Without Pillow the "
+        "file is copied unchanged and the returned steps say so.",
+        _object_schema(
+            {
+                "path": _STR,
+                "data_url": _STR,
+                "name": _STR,
+                "max_side": _INT,
+                "fmt": {"type": "string", "enum": list(image_input.WRITABLE_FORMATS)},
+                "quality": _INT,
+                "grayscale": _BOOL,
+                "autocontrast": _BOOL,
+                "allow_external": _BOOL,
+                "allow_small": _BOOL,
+                "inline": _BOOL,
+                "max_bytes": _INT,
+            }
+        ),
+        _h_image_prepare,
     ),
     Tool(
         "nx_prepare_session",

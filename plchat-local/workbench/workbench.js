@@ -5,7 +5,7 @@
   const state = { settings: null, review: null, online: false, busy: false, remoteBusy: false,
     settingsBusy: false, dirty: false, drafts: new Map(), logs: [], toolsSeen: new Set(),
     job: null, jobPolling: false, polling: false, lastReview: '', lastStage: '', lastProgressError: false,
-    history: [], pendingPlanButton: null };
+    history: [], pendingPlanButton: null, imageOneShot: true, imageMaxSide: 1600 };
   const JOB_KEY = 'dc-workbench-job-v1';
   const stages = { thinking: '模型正在组织回答', streaming: '正在接收回答', tool: '正在查询工具',
     authoring: '正在生成建模计划', validating: '正在检查脚本', retry: '正在修正计划',
@@ -57,6 +57,7 @@
     $('clear-plan').disabled = locked || !state.online || !state.review?.hasPlan;
     $('export-plan').disabled = !state.review?.hasPlan;
     $('new-chat').disabled = locked;
+    $('pick-image').disabled = locked;
     $('check-environment').disabled = locked || !state.online || !state.settings || state.settingsBusy;
     $('test-connection').disabled = locked || !state.online || !state.settings || state.settingsBusy;
     $('save-settings').disabled = locked || !state.online || !state.settings || state.settingsBusy;
@@ -132,6 +133,10 @@
   async function loadSettings(force = false) {
     const result = requireOK(await api('/api/settings'));
     state.settings = result;
+    // 默认「一发即摘」:图只跟一条消息走。宿主没给这个字段时也当开(老宿主兼容)。
+    state.imageOneShot = !(result.image && result.image.oneShot === false);
+    if (result.image && result.image.maxSide) state.imageMaxSide = result.image.maxSide;
+    fillBudget(result.tool || {});
     text('active-model', result.active.label + ' · ' + result.active.model);
     text('model-chip', result.active.model || '未设置模型'); $('model-chip').title = result.active.label;
     text('footer-workspace', result.nx.nxWorkspace || '工作区未配置'); $('footer-workspace').title = result.nx.nxWorkspace || '';
@@ -150,6 +155,49 @@
     syncControls();
   }
   function dirty() { state.dirty = true; text('settings-dirty', '有未保存修改'); snapshotDraft(); }
+
+  /* ---- 状态栏上方的「工具额度」 ----
+   * 放在这里而不是塞进连接配置:它是每次提问前最可能想调的一格(问复杂图纸就调大、
+   * 想快就调小),埋进设置面板要点三层。改动只 POST tool/image 两个块,不会碰供应商。 */
+  function fillBudget(tool) {
+    const rounds = Number(tool.maxToolRounds);
+    const calls = Number(tool.maxToolCalls);
+    const timeout = Number(tool.toolTimeoutMs);
+    $('budget-rounds').value = Number.isFinite(rounds) && rounds > 0 ? rounds : '';
+    $('budget-calls').value = Number.isFinite(calls) && calls > 0 ? calls : '';
+    $('budget-timeout').value = Number.isFinite(timeout) && timeout > 0 ? Math.round(timeout / 1000) : '';
+    $('budget-one-shot').checked = state.imageOneShot !== false;
+    budgetDirty(false);
+  }
+  function budgetDirty(on) {
+    $('budget-save').disabled = !on || !state.online;
+    if (!on) feedback('budget-feedback', '');
+  }
+  async function saveBudget() {
+    const payload = {
+      tool: {
+        maxToolRounds: Number($('budget-rounds').value) || 8,
+        maxToolCalls: Number($('budget-calls').value) || 14,
+        toolTimeoutMs: Math.round((Number($('budget-timeout').value) || 60) * 1000)
+      },
+      image: { oneShot: $('budget-one-shot').checked, maxSide: state.imageMaxSide }
+    };
+    feedback('budget-feedback', '正在应用…');
+    try {
+      requireOK(await api('/api/settings', payload, 15000));
+      state.imageOneShot = payload.image.oneShot;
+      if (state.imageOneShot && state.image) clearImage();
+      feedback('budget-feedback', '已应用：最多 ' + payload.tool.maxToolRounds + ' 轮 / '
+        + payload.tool.maxToolCalls + ' 次调用 / 单次 ' + Math.round(payload.tool.toolTimeoutMs / 1000) + ' 秒'
+        + (state.imageOneShot ? '；图一发即摘' : '；图会留下'));
+      log('额度', '工具额度已更新：最多 ' + payload.tool.maxToolRounds + ' 轮 / ' + payload.tool.maxToolCalls
+        + ' 次调用 / 单次超时 ' + Math.round(payload.tool.toolTimeoutMs / 1000) + ' 秒'
+        + '；图' + (state.imageOneShot ? '一发即摘' : '发后保留'));
+      budgetDirty(false);
+      await loadSettings();
+    } catch (e) { feedback('budget-feedback', e.message, true); log('额度', e.message, true); }
+  }
+  function budgetInput() { budgetDirty(true); feedback('budget-feedback', '改完点「应用」生效。'); }
   function providerPayload() {
     return { id: $('provider').value, model: $('model').value.trim(), baseUrl: $('base-url').value.trim(),
       apiKey: $('clear-key').checked ? null : $('api-key').value };
@@ -273,15 +321,129 @@
     } catch (e) { log('计划', e.message, true); toast(e.message); }
     finally { setBusy(false); }
   }
+  /* ---- 读图:选文件/拖入 → 宿主预处理 + 测量 → 附在下一条提问上 ----
+   * 浏览器这边只负责"拿到字节"(WebView2 与普通浏览器都支持的 input[type=file]),
+   * 解码、缩放、增强、测量全在宿主侧,这样 NX 自带解释器不需要任何第三方库。
+   * 选完立刻送一次 /api/image/prepare:主人当场就能看到"这个模型能不能看图"、
+   * 预处理做了哪几步、图像有多低分辨率,而不是发出去才发现读不出来。 */
+  const IMAGE_MAX_SIDE = 1600;
+  const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tif', '.tiff', '.webp'];
+  function imageSummary(prepared) {
+    if (!prepared) return '';
+    return prepared.width + '×' + prepared.height + ' px · ' + ((prepared.bytes || 0) / 1024).toFixed(0) + ' KB';
+  }
+  function clearImage() {
+    state.image = null; state.imageInfo = null;
+    $('image-attach').hidden = true;
+    $('image-thumb').removeAttribute('src');
+    text('image-name', '—'); text('image-meta', ''); text('image-route', '');
+    const input = $('image-input'); if (input) input.value = '';
+  }
+  /** 把之前摘掉的图放回待发送区(发送失败时用,不让主人白选一次)。 */
+  function restoreImage(saved) {
+    if (!saved || !saved.image) return;
+    state.image = saved.image; state.imageInfo = saved.info;
+    const src = saved.image.dataUrl || (saved.info && saved.info.preview) || '';
+    if (src) $('image-thumb').src = src;
+    $('image-attach').hidden = false;
+    text('image-name', saved.image.name || '图像');
+    text('image-meta', saved.summary || '');
+    text('image-route', saved.route || '');
+  }
+  async function preparePickedImage(source, name) {
+    clearImage();
+    $('image-attach').hidden = false;
+    text('image-name', name || '图像'); text('image-meta', '正在预处理…');
+    try {
+      const result = await api('/api/image/prepare', { image: Object.assign({ name: name || '图像' }, source), options: { maxSide: state.imageMaxSide } }, 180000);
+      if (!result.ok) {
+        clearImage();
+        const reason = (result.hint || '读图失败') + (result.message ? '：' + result.message : '');
+        log('读图', reason, true); toast(reason);
+        if (result.html) message('assistant', result.html, true);
+        return;
+      }
+      state.imageInfo = result;
+      state.image = {
+        name: name || '图像',
+        path: result.prepared.absolutePath || null,
+        dataUrl: result.preview || source.dataUrl || null
+      };
+      $('image-thumb').src = state.image.dataUrl || '';
+      $('image-attach').hidden = false;
+      text('image-name', name || '图像');
+      text('image-meta', imageSummary(result.prepared) + ' · ' + (result.prepared.steps || []).join(' → '));
+      text('image-route', result.vision.supported ? '模型可直读图像'
+        : (result.vision.unknown ? '看图能力未声明 → 附结构化简报' : '当前模型不能看图 → 附结构化简报'));
+      log('读图', (name || '图像') + ' 已就绪：' + (result.vision.supported ? '按多模态发送' : '按结构化简报发送')
+        + '（' + (result.prepared.steps || []).join(' → ') + '）');
+      (result.warnings || []).filter(Boolean).forEach(w => log('读图', w, true));
+      return true;
+    } catch (e) { clearImage(); log('读图', e.message, true); toast(e.message); return false; }
+  }
+  /* NX 菜单里选的图会先 POST 到 /api/image/handoff;页面拿到就自动挂上。 */
+  async function pickUpHandoff() {
+    try {
+      const result = await api('/api/image/handoff', undefined, 15000);
+      if (!result || !result.path) return;
+      const name = String(result.path).split(/[\\/]/).pop();
+      log('读图', 'NX 传来一张图：' + result.path);
+      await preparePickedImage({ path: result.path }, name);
+    } catch (e) { /* 没有交接是常态,不吵 */ }
+  }
+  function pickImageFile(file) {
+    if (!file) return;
+    const ext = (String(file.name).match(/\.[^.]+$/) || [''])[0].toLowerCase();
+    if (!IMAGE_EXTS.includes(ext)) { toast('不支持的图像格式：' + (ext || file.type || '未知')); log('读图', '不支持的格式 ' + file.name, true); return; }
+    if (file.size > 40 * 1024 * 1024) { toast('图像超过 40 MB 上限（' + (file.size / 1048576).toFixed(1) + ' MB）'); log('读图', file.name + ' 超过 40 MB 上限', true); return; }
+    const reader = new FileReader();
+    reader.onload = () => preparePickedImage({ dataUrl: String(reader.result) }, file.name);
+    reader.onerror = () => { toast('读取文件失败'); log('读图', '读取 ' + file.name + ' 失败', true); };
+    reader.readAsDataURL(file);
+  }
+
   async function ask(event) {
     event?.preventDefault(); if ($('send-message').disabled) return;
-    const question = $('prompt').value.trim(); if (!question) { $('prompt').focus(); toast('请先输入问题或建模需求。'); return; }
-    message('user', question); $('prompt').value = ''; setBusy(true, '正在发送问题'); log('对话', '已发送问题，等待模型返回。');
+    const question = $('prompt').value.trim();
+    const attached = state.image;
+    if (!question && !attached) { $('prompt').focus(); toast('请先输入问题或建模需求，或先读一张图。'); return; }
+    const shown = question || '（只发了图，没有文字）';
+    const userNode = message('user', shown);
+    if (attached) {
+      const bubble = userNode.querySelector('.message-main') || userNode;
+      const img = node('img', 'message-image');
+      img.src = attached.dataUrl || (state.imageInfo && state.imageInfo.preview) || '';
+      img.alt = attached.name || '图像';
+      bubble.append(img);
+    }
+    $('prompt').value = ''; setBusy(true, '正在发送问题');
+    log('对话', attached ? '已发送问题（带图），等待模型返回。' : '已发送问题，等待模型返回。');
+    // 「一发即摘」:图和这一条消息绑定,发出去就把待发送区腾空,不用主人再点 ×。
+    // 先存一份,发送失败再放回去 —— 不能让人白选一次图。
+    const savedImage = attached ? {
+      image: attached, info: state.imageInfo,
+      summary: $('image-meta').textContent, route: $('image-route').textContent
+    } : null;
+    if (attached && state.imageOneShot) clearImage();
     try {
-      const result = await api('/api/ask', { question, history: state.history }, 900000);
+      const payload = { question, history: state.history };
+      // 已经预处理过的图直接给宿主路径,并告诉它别再处理一遍:选图时已经算过
+      // 一次 prepare,重复做只会多出一个 *.prepared.jpg 和一次白白等待。
+      if (attached) {
+        payload.imageOptions = attached.path
+          ? { maxSide: state.imageMaxSide, reusePrepared: true }
+          : { maxSide: state.imageMaxSide };
+        payload.image = attached.path
+          ? { path: attached.path, name: attached.name }
+          : { dataUrl: attached.dataUrl, name: attached.name };
+      }
+      const result = await api('/api/ask', payload, 900000);
       if (!result.data || typeof result.data.answer !== 'string') throw new Error('回答格式异常，请查看宿主日志。');
       const meta = result.meta || {};
-      const reply = message('assistant', result.data.answer, true, [meta.model, meta.ms != null ? (meta.ms / 1000).toFixed(1) + ' s' : '', meta.tools != null ? meta.tools + ' 次工具调用' : ''].filter(Boolean).join(' · '));
+      const badges = [meta.model, meta.ms != null ? (meta.ms / 1000).toFixed(1) + ' s' : '',
+        meta.tools != null ? meta.tools + ' 次工具调用' : '',
+        meta.image ? (meta.image.route === 'vision' ? '已发送图像' : '已发送图像简报') : ''].filter(Boolean);
+      const reply = message('assistant', result.data.answer, true, badges.join(' · '));
       if (meta.provider && !meta.reviewSubmitted && isPlanReply(question, result.data.text)) {
         const actions = node('div', 'message-actions');
         const button = node('button', 'button chat-plan-button', '加入计划');
@@ -291,12 +453,20 @@
         syncControls();
       }
       if (meta.provider && typeof result.data.text === 'string') {
-        state.history.push({ role: 'user', content: question }, { role: 'assistant', content: result.data.text });
+        state.history.push({ role: 'user', content: question || '（图像）' + shown }, { role: 'assistant', content: result.data.text });
         state.history = state.history.slice(-8);
+      }
+      if (attached && meta.image) {
+        log('读图', '图像已随本条消息发出（' + (meta.image.route === 'vision' ? '多模态' : '结构化简报') + '）'
+          + (state.imageOneShot ? '；已自动摘除，想再问这张图请重新读入。' : '；已留在待发送区，下一条还会再带一次。'));
       }
       log('对话', meta.provider ? '已收到模型回答。' : '宿主返回错误说明，请查看对话。', !meta.provider);
       if (meta.reviewSubmitted) { await refreshReview(); toast('计划已提交，右侧可查看复核步骤。'); }
-    } catch (e) { message('assistant', e.message); log('对话', e.message, true); }
+    } catch (e) {
+      message('assistant', e.message); log('对话', e.message, true);
+      // 发送没成功就不能把图吃掉:放回待发送区,主人重试一次即可。
+      if (savedImage && !state.image) { restoreImage(savedImage); log('读图', '这次没发成功，图已放回待发送区。', true); }
+    }
     finally { setBusy(false); $('prompt').focus(); }
   }
   function dialog(title, body, confirmLabel = '确认', info = false) {
@@ -489,6 +659,27 @@
   $('clear-key').addEventListener('change', () => { $('api-key').disabled = $('clear-key').checked; dirty(); });
   $('test-connection').addEventListener('click', testConnection); $('check-environment').addEventListener('click', checkEnvironment);
   $('author-plan').addEventListener('click', author);
+  ['budget-rounds', 'budget-calls', 'budget-timeout'].forEach(id => $(id).addEventListener('input', budgetInput));
+  $('budget-one-shot').addEventListener('change', budgetInput);
+  $('budget-save').addEventListener('click', saveBudget);
+  // 读图:按钮 → 文件对话框;也支持把图直接拖到输入框里。两者走同一条管线。
+  $('pick-image').addEventListener('click', () => $('image-input').click());
+  $('ribbon-image').addEventListener('click', () => $('image-input').click());
+  $('image-input').addEventListener('change', event => pickImageFile(event.target.files && event.target.files[0]));
+  $('image-clear').addEventListener('click', () => { clearImage(); log('读图', '已移除待发送图像。'); });
+  ['dragenter', 'dragover'].forEach(type => $('chat-form').addEventListener(type, event => {
+    if (event.dataTransfer && Array.from(event.dataTransfer.types || []).includes('Files')) {
+      event.preventDefault(); $('chat-form').classList.add('drop-active');
+    }
+  }));
+  ['dragleave', 'drop'].forEach(type => $('chat-form').addEventListener(type, () => $('chat-form').classList.remove('drop-active')));
+  $('chat-form').addEventListener('drop', event => {
+    const files = event.dataTransfer && event.dataTransfer.files;
+    if (files && files.length) { event.preventDefault(); pickImageFile(files[0]); }
+  });
+  // 宿主可能存着"NX 菜单刚选好的图",进页面/切回页面时各取一次。
+  pickUpHandoff();
+  window.addEventListener('focus', () => { if (!state.image) pickUpHandoff(); });
   document.querySelectorAll('[data-run]').forEach(el => el.addEventListener('click', () => run(el.dataset.run)));
   document.querySelectorAll('[data-prompt]').forEach(el => el.addEventListener('click', () => { $('prompt').value = el.dataset.prompt; $('prompt').focus(); }));
   $('focus-prompt').addEventListener('click', () => openWorkspaceWindow('输入需求', 'chat', 'chat-panel', 'prompt'));

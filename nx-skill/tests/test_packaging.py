@@ -65,6 +65,24 @@ def _code_string_literals() -> list[tuple[str, str]]:
     return found
 
 
+def _optional_import_linenos(tree: ast.AST) -> set[int]:
+    """Line numbers of imports that sit inside a try/except.
+
+    The invariant is "this package imports on a bare machine", not "Pillow is
+    never mentioned". `nx_skill.images` upgrades itself when Pillow/numpy are
+    importable and degrades with an explicit message when they are not, and the
+    try/except is what makes that difference visible to this test instead of
+    hiding it: an unguarded third-party import still fails the suite.
+    """
+    guarded: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try):
+            for inner in ast.walk(node):
+                if isinstance(inner, (ast.Import, ast.ImportFrom)):
+                    guarded.add(inner.lineno)
+    return guarded
+
+
 def test_package_imports_without_third_party_dependencies():
     """It must run on a bare machine and inside NX's embedded Python, where pip is unavailable."""
     stdlib_modules = {
@@ -74,11 +92,16 @@ def test_package_imports_without_third_party_dependencies():
         # platform-specific but always stdlib
         "__future__", "ctypes", "winreg", "posixpath", "ntpath",
         "tempfile", "uuid", "hashlib", "secrets",
+        # used by nx_skill.images for header parsing and base64 payloads
+        "binascii", "struct",
     }
     offenders: list[str] = []
     for path in _python_files():
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        optional = _optional_import_linenos(tree)
         for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and node.lineno in optional:
+                continue
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     if alias.name.split(".")[0] not in stdlib_modules:
@@ -87,6 +110,23 @@ def test_package_imports_without_third_party_dependencies():
                 if node.module.split(".")[0] not in stdlib_modules:
                     offenders.append(f"{path.name}: from {node.module}")
     assert offenders == [], f"non-stdlib imports found: {offenders}"
+
+
+def test_optional_image_imports_are_guarded():
+    """The flip side of the exemption above: PIL/numpy may only appear in a try/except."""
+    unguarded: list[str] = []
+    for path in _python_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        optional = _optional_import_linenos(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and node.lineno not in optional:
+                names = [a.name.split(".")[0] for a in getattr(node, "names", [])]
+                if getattr(node, "module", None):
+                    names.append(node.module.split(".")[0])
+                for name in names:
+                    if name in {"PIL", "numpy", "cv2", "trimesh"}:
+                        unguarded.append(f"{path.name}:{node.lineno}: {name}")
+    assert unguarded == [], f"third-party image imports must be inside try/except: {unguarded}"
 
 
 def test_no_code_literal_is_a_hardcoded_machine_path():
